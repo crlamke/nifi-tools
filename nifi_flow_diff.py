@@ -18,6 +18,7 @@ Exit status: 0 = no differences, 1 = differences found, 2 = error.
 Examples:
   nifi_flow_diff.py old.json new.json
   nifi_flow_diff.py old.json new.json --ignore-position --type processor,connection
+  nifi_flow_diff.py old.json new.json -o diff.html        # format inferred from extension
   nifi_flow_diff.py old.json new.json --format md -o diff.md
   nifi_flow_diff.py old.json new.json --format json | jq '.summary'
   nifi_flow_diff.py dev.json prod.json --match-by name --ignore 'properties.Password*'
@@ -27,12 +28,14 @@ import argparse
 import difflib
 import fnmatch
 import gzip
+import html
 import json
 import os
 import sys
 from collections import defaultdict
+from datetime import datetime
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 # (child list key inside a VersionedProcessGroup, display type)
 CHILD_LISTS = [
@@ -507,6 +510,206 @@ def render_markdown(result, args):
     return "\n".join(out)
 
 
+# Self-contained HTML report: inline CSS and a little vanilla JS (search box,
+# status toggles, expand/collapse). No external files or network access, so it
+# opens offline and can be emailed or attached as a single file. The report
+# is fully readable with JavaScript disabled; the script only adds filtering.
+HTML_CSS = """
+:root{--bg:#f7f7f5;--card:#fff;--fg:#1d1d1f;--muted:#6b6b70;--line:#e2e2e0;--code:#f1f1ef;
+--add:#1a7f37;--add-bg:#e6f4ea;--rem:#b42318;--rem-bg:#fde8e7;--mod:#9a6700;--mod-bg:#fff4d6;
+--mov:#0b62a4;--mov-bg:#e3f0fb}
+@media (prefers-color-scheme:dark){:root{--bg:#141416;--card:#1d1d20;--fg:#e8e8ea;--muted:#9a9aa0;
+--line:#323236;--code:#26262a;--add:#5fd38a;--add-bg:#163322;--rem:#ff8a80;--rem-bg:#3b1a19;
+--mod:#f2c35b;--mod-bg:#3a2e12;--mov:#7cc0f5;--mov-bg:#12304a}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+main{max-width:1200px;margin:0 auto;padding:24px 16px 64px}
+h1{font-size:22px;margin:0 0 12px}
+h2{font-size:17px;margin:28px 0 10px;padding-bottom:6px;border-bottom:1px solid var(--line)}
+code,pre,.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12.5px}
+.meta{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;margin:0 0 20px;color:var(--muted)}
+.meta b{color:var(--fg);font-weight:600}
+.meta span{overflow-wrap:anywhere}
+.card{background:var(--card);border:1px solid var(--line);border-radius:8px;overflow-x:auto}
+table.sum{border-collapse:collapse;width:100%;max-width:640px}
+table.sum th,table.sum td{padding:6px 12px;border-bottom:1px solid var(--line);text-align:right}
+table.sum th:first-child,table.sum td:first-child{text-align:left}
+table.sum tr:last-child td{border-bottom:0;font-weight:600}
+table.sum a{color:inherit}
+td.zero{color:var(--muted)}
+.toolbar{position:sticky;top:0;z-index:2;display:flex;flex-wrap:wrap;gap:8px 14px;align-items:center;
+padding:10px 12px;margin:20px 0 0;background:var(--card);border:1px solid var(--line);border-radius:8px}
+.toolbar input[type=search]{flex:1 1 220px;min-width:0;padding:6px 10px;border:1px solid var(--line);
+border-radius:6px;background:var(--bg);color:var(--fg);font:inherit}
+.toolbar label{white-space:nowrap;cursor:pointer}
+.toolbar button{padding:5px 10px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--fg);font:inherit;cursor:pointer}
+#count{color:var(--muted);margin-left:auto}
+details.chg{background:var(--card);border:1px solid var(--line);border-left-width:4px;border-radius:6px;margin:6px 0}
+details.added{border-left-color:var(--add)}details.removed{border-left-color:var(--rem)}
+details.modified{border-left-color:var(--mod)}details.moved{border-left-color:var(--mov)}
+summary{padding:7px 12px;cursor:pointer;display:flex;flex-wrap:wrap;gap:4px 10px;align-items:baseline}
+summary::-webkit-details-marker{display:none}
+summary::before{content:"\\25B8";color:var(--muted);width:10px}
+details[open]>summary::before{content:"\\25BE"}
+.badge{font-size:11px;font-weight:700;letter-spacing:.04em;padding:1px 7px;border-radius:10px}
+.added .badge{color:var(--add);background:var(--add-bg)}.removed .badge{color:var(--rem);background:var(--rem-bg)}
+.modified .badge{color:var(--mod);background:var(--mod-bg)}.moved .badge{color:var(--mov);background:var(--mov-bg)}
+.path{color:var(--muted)}.name{font-weight:600;overflow-wrap:anywhere}.cid{color:var(--muted);font-size:11.5px}
+.body{padding:2px 12px 10px 34px}
+table.fields{border-collapse:collapse;width:100%;table-layout:fixed}
+table.fields th{text-align:left;color:var(--muted);font-weight:500;font-size:12px;padding:4px 8px;border-bottom:1px solid var(--line)}
+table.fields td{vertical-align:top;padding:5px 8px;border-bottom:1px solid var(--line);overflow-wrap:anywhere}
+table.fields tr:last-child td{border-bottom:0}
+table.fields col.f{width:28%}
+.old{color:var(--rem)}.new{color:var(--add)}.op{color:var(--muted);font-size:12px}
+pre.diff{margin:4px 0 0;padding:8px 10px;background:var(--code);border-radius:6px;overflow-x:auto;white-space:pre}
+pre.diff .a{color:var(--add)}pre.diff .r{color:var(--rem)}pre.diff .h{color:var(--muted)}
+.move{color:var(--mov);font-size:12.5px;margin-top:4px}
+.empty{padding:16px;color:var(--add);font-weight:600}
+.hidden{display:none!important}
+@media print{.toolbar{display:none}details.chg{break-inside:avoid}}
+"""
+
+HTML_JS = """
+(function(){
+  var q=document.getElementById('q'), count=document.getElementById('count');
+  var items=[].slice.call(document.querySelectorAll('details.chg'));
+  var boxes=[].slice.call(document.querySelectorAll('input[data-status]'));
+  var sections=[].slice.call(document.querySelectorAll('section.type'));
+  function apply(){
+    var term=q.value.toLowerCase().trim(), on={}, shown=0;
+    boxes.forEach(function(b){on[b.dataset.status]=b.checked;});
+    items.forEach(function(d){
+      var ok=on[d.dataset.status] && (!term || d.textContent.toLowerCase().indexOf(term)>=0);
+      d.classList.toggle('hidden',!ok); if(ok) shown++;
+    });
+    sections.forEach(function(s){s.classList.toggle('hidden',!s.querySelector('details.chg:not(.hidden)'));});
+    count.textContent=shown+' of '+items.length+' shown';
+  }
+  q.addEventListener('input',apply);
+  boxes.forEach(function(b){b.addEventListener('change',apply);});
+  document.getElementById('expand').onclick=function(){items.forEach(function(d){d.open=true;});};
+  document.getElementById('collapse').onclick=function(){items.forEach(function(d){d.open=false;});};
+  apply();
+})();
+"""
+
+
+def render_html(result, args):
+    esc = html.escape
+    left, right = result["left"], result["right"]
+    changes = result["changes"]
+
+    def anchor(t):
+        return "t-" + "".join(ch if ch.isalnum() else "-" for ch in t.lower())
+
+    def val(v):
+        return esc(fmt_value(v, args.max_value_len))
+
+    out = [
+        "<!DOCTYPE html>",
+        '<html lang="en"><head><meta charset="utf-8">',
+        '<meta name="viewport" content="width=device-width,initial-scale=1">',
+        f"<title>NiFi flow diff - {esc(os.path.basename(left['file']))} vs {esc(os.path.basename(right['file']))}</title>",
+        f"<style>{HTML_CSS}</style></head><body><main>",
+        "<h1>NiFi flow diff</h1>",
+        '<div class="meta">',
+        f"<b>A</b><span><code>{esc(left['file'])}</code> &middot; {esc(left['kind'])}, {left['components']:,} components</span>",
+        f"<b>B</b><span><code>{esc(right['file'])}</code> &middot; {esc(right['kind'])}, {right['components']:,} components</span>",
+        f"<b>Matched by</b><span>{esc(result['match_by'])}</span>",
+        f"<b>Generated</b><span>{datetime.now():%Y-%m-%d %H:%M:%S} by nifi_flow_diff.py {__version__}</span>",
+        "</div>",
+    ]
+
+    if not changes:
+        out.append('<div class="card empty">No differences found.</div></main></body></html>')
+        return "\n".join(out)
+
+    # Summary table
+    rows = summary_table(result["summary"])
+    out.append('<div class="card"><table class="sum"><thead><tr>')
+    out.extend(f"<th>{esc(h)}</th>" for h in rows[0])
+    out.append("</tr></thead><tbody>")
+    for r in rows[1:]:
+        label = esc(r[0]) if r[0] == "Total" or args.summary else f'<a href="#{anchor(r[0])}">{esc(r[0])}</a>'
+        cells = "".join(f'<td class="zero">{n}</td>' if n == "0" else f"<td>{n}</td>" for n in r[1:])
+        out.append(f"<tr><td>{label}</td>{cells}</tr>")
+    out.append("</tbody></table></div>")
+
+    if args.summary:
+        out.append("</main></body></html>")
+        return "\n".join(out)
+
+    # Toolbar (only does anything with JS enabled; harmless without it)
+    present = [s for s in STATUS_ORDER if any(c["status"] == s for c in changes)]
+    out.append('<div class="toolbar"><input id="q" type="search" placeholder="Filter by name, path, property, value...">')
+    for s in present:
+        out.append(f'<label><input type="checkbox" data-status="{s}" checked> {s}</label>')
+    out.append('<button id="expand" type="button">Expand all</button>'
+               '<button id="collapse" type="button">Collapse all</button><span id="count"></span></div>')
+
+    # Details grouped by component type
+    current = None
+    for c in changes:
+        if c["type"] != current:
+            if current is not None:
+                out.append("</section>")
+            current = c["type"]
+            out.append(f'<section class="type"><h2 id="{anchor(current)}">{esc(current)}</h2>')
+        _, _, label = STATUS_STYLE[c["status"]]
+        has_body = bool(c["fields"]) or (c.get("moved") and c["status"] == "modified")
+        open_attr = " open" if has_body else ""
+        out.append(f'<details class="chg {c["status"]}" data-status="{c["status"]}"{open_attr}><summary>'
+                   f'<span class="badge">{label}</span>'
+                   + (f'<span class="path mono">{esc(c["path"])}</span>' if c["path"] else "")
+                   + f'<span class="name">{esc(c["name"])}</span>'
+                   + (f'<span class="cid mono">{esc(str(c["id"]))}</span>' if args.show_ids and c["id"] else "")
+                   + (f'<span class="move">{esc(describe_move(c["moved"]))}</span>'
+                      if c.get("moved") and c["status"] == "moved" else "")
+                   + "</summary>")
+        if has_body:
+            out.append('<div class="body">')
+            if c["fields"]:
+                out.append('<table class="fields"><colgroup><col class="f"><col><col></colgroup>'
+                           "<thead><tr><th>Field</th><th>Old (A)</th><th>New (B)</th></tr></thead><tbody>")
+                for f in c["fields"]:
+                    field = f'<td class="mono">{esc(f["field"])}</td>'
+                    op = f["op"]
+                    if is_long_text(f):
+                        lines = []
+                        for line in text_diff_lines(f["old"], f["new"], args.max_diff_lines):
+                            cls = ("h" if line.startswith(("---", "+++", "@@", "..."))
+                                   else "a" if line.startswith("+") else "r" if line.startswith("-") else "")
+                            lines.append(f'<span class="{cls}">{esc(line)}</span>' if cls else esc(line))
+                        out.append(f'<tr>{field}<td colspan="2"><span class="op">text changed</span>'
+                                   f'<pre class="diff">{chr(10).join(lines)}</pre></td></tr>')
+                    elif op == "relocated":
+                        out.append(f'<tr><td class="mono">(parent group)</td><td class="old mono">{esc(f["old"])}</td>'
+                                   f'<td class="new mono">{esc(f["new"])}</td></tr>')
+                    elif op in ("added", "added item"):
+                        note = '<span class="op">item added</span><br>' if op == "added item" else ""
+                        out.append(f'<tr>{field}<td class="op">(absent)</td><td class="new mono">{note}{val(f["new"])}</td></tr>')
+                    elif op in ("removed", "removed item"):
+                        note = '<span class="op">item removed</span><br>' if op == "removed item" else ""
+                        out.append(f'<tr>{field}<td class="old mono">{note}{val(f["old"])}</td><td class="op">(absent)</td></tr>')
+                    elif op == "reordered":
+                        out.append(f'<tr>{field}<td class="old mono"><span class="op">order changed</span><br>{val(f["old"])}</td>'
+                                   f'<td class="new mono">{val(f["new"])}</td></tr>')
+                    else:
+                        out.append(f'<tr>{field}<td class="old mono">{val(f["old"])}</td><td class="new mono">{val(f["new"])}</td></tr>')
+                out.append("</tbody></table>")
+            if c.get("moved") and c["status"] == "modified":
+                out.append(f'<div class="move">Also moved: {esc(describe_move(c["moved"]))}</div>')
+            out.append("</div>")
+        out.append("</details>")
+    out.append("</section>")
+    out.append(f"<script>{HTML_JS}</script></main></body></html>")
+    return "\n".join(out)
+
+
+FORMAT_BY_EXTENSION = {".html": "html", ".htm": "html", ".md": "md", ".markdown": "md", ".json": "json"}
+
+
 # --------------------------------------------------------------------------- CLI
 
 def normalize_type(t):
@@ -531,7 +734,8 @@ def build_parser():
         formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("old", help="baseline flow file (A)")
     p.add_argument("new", help="flow file to compare against the baseline (B)")
-    p.add_argument("-f", "--format", choices=["text", "md", "json"], default="text", help="output format (default: text)")
+    p.add_argument("-f", "--format", choices=["text", "md", "json", "html"], default=None,
+                   help="output format (default: text, or inferred from the -o extension: .html, .md, .json)")
     p.add_argument("-o", "--output", help="write the report to this file instead of stdout")
     p.add_argument("--match-by", choices=["id", "name"], default="id",
                    help="match components by versioned identifier (default) or by group path + name")
@@ -599,18 +803,29 @@ def main(argv=None):
         "changes": changes,
     }
 
-    if args.format == "json":
+    fmt = args.format
+    if fmt is None:
+        ext = os.path.splitext(args.output)[1].lower() if args.output else ""
+        fmt = FORMAT_BY_EXTENSION.get(ext, "text")
+
+    if fmt == "json":
         report = json.dumps(result, indent=2, ensure_ascii=False, default=str)
-    elif args.format == "md":
+    elif fmt == "md":
         report = render_markdown(result, args)
+    elif fmt == "html":
+        report = render_html(result, args)
     else:
         use_color = not args.no_color and not args.output and sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
         report = render_text(result, args, Style(use_color))
 
     if args.output:
-        with open(args.output, "w", encoding="utf-8") as fh:
-            fh.write(report + "\n")
-        print(f"Report written to {args.output} ({len(changes)} changed components)", file=sys.stderr)
+        try:
+            with open(args.output, "w", encoding="utf-8") as fh:
+                fh.write(report + "\n")
+        except OSError as e:
+            print(f"error: cannot write {args.output}: {e}", file=sys.stderr)
+            return 2
+        print(f"{fmt.upper()} report written to {args.output} ({len(changes)} changed components)", file=sys.stderr)
     else:
         print(report)
     return 1 if changes else 0
